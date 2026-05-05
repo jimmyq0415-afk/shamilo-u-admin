@@ -473,11 +473,11 @@ export default function App() {
     <div style={styles.page}>
       <div style={styles.container}>
         <div style={styles.hero}>
-          <h1 style={styles.pageTitle}>蝦米攏烏｜商家端</h1>
-          <p style={styles.pageSubtitle}>
-            這裡同時管理菜單、分類順序與接單。顧客端會依照分類管理的順序顯示菜單。
-          </p>
-        </div>
+  <h1 style={styles.pageTitle}>蝦米攏烏｜商家管理端</h1>
+  <p style={styles.pageSubtitle}>
+    這裡同時管理菜單、分類順序與接單。顧客端會依照分類管理設定的順序顯示菜單。
+  </p>
+</div>
 
         <div style={styles.layout}>
           <div style={styles.leftColumn}>
