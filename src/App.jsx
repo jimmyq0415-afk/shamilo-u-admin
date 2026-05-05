@@ -24,13 +24,25 @@ const emptyOptionForm = {
   price_delta: '',
 }
 
+const emptyCategoryForm = {
+  name: '',
+  sort_order: '',
+}
+
 export default function App() {
   const [menuItems, setMenuItems] = useState([])
+  const [menuCategories, setMenuCategories] = useState([])
   const [optionsMap, setOptionsMap] = useState({})
   const [orders, setOrders] = useState([])
   const [orderItemsMap, setOrderItemsMap] = useState({})
+
   const [form, setForm] = useState(emptyForm)
   const [editingId, setEditingId] = useState(null)
+
+  const [categoryForm, setCategoryForm] = useState(emptyCategoryForm)
+  const [editingCategoryId, setEditingCategoryId] = useState(null)
+  const [categoryLoading, setCategoryLoading] = useState(false)
+
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState('')
   const [optionForms, setOptionForms] = useState({})
@@ -48,6 +60,21 @@ export default function App() {
     }
 
     setMenuItems(data || [])
+  }
+
+  async function fetchMenuCategories() {
+    const { data, error } = await supabase
+      .from('menu_categories')
+      .select('*')
+      .order('sort_order', { ascending: true })
+      .order('id', { ascending: true })
+
+    if (error) {
+      setMessage('讀取分類失敗：' + error.message)
+      return
+    }
+
+    setMenuCategories(data || [])
   }
 
   async function fetchOptions() {
@@ -101,7 +128,7 @@ export default function App() {
   }
 
   async function refreshAll() {
-    await Promise.all([fetchMenuItems(), fetchOptions(), fetchOrders()])
+    await Promise.all([fetchMenuItems(), fetchMenuCategories(), fetchOptions(), fetchOrders()])
   }
 
   useEffect(() => {
@@ -122,9 +149,23 @@ export default function App() {
     }))
   }
 
+  function handleCategoryChange(e) {
+    const { name, value } = e.target
+    setCategoryForm((prev) => ({
+      ...prev,
+      [name]: value,
+    }))
+  }
+
   function resetForm() {
     setForm(emptyForm)
     setEditingId(null)
+    setMessage('')
+  }
+
+  function resetCategoryForm() {
+    setCategoryForm(emptyCategoryForm)
+    setEditingCategoryId(null)
     setMessage('')
   }
 
@@ -141,6 +182,15 @@ export default function App() {
     })
     setMessage('已載入商品，可直接修改')
     window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  function handleEditCategory(category) {
+    setEditingCategoryId(category.id)
+    setCategoryForm({
+      name: category.name ?? '',
+      sort_order: category.sort_order ?? '',
+    })
+    setMessage('已載入分類，可直接修改')
   }
 
   async function handleSubmit(e) {
@@ -172,10 +222,7 @@ export default function App() {
     let error
 
     if (editingId) {
-      const result = await supabase
-        .from('menu_items')
-        .update(payload)
-        .eq('id', editingId)
+      const result = await supabase.from('menu_items').update(payload).eq('id', editingId)
       error = result.error
     } else {
       const result = await supabase.from('menu_items').insert([payload])
@@ -189,9 +236,79 @@ export default function App() {
       return
     }
 
+    if (payload.category) {
+      await ensureCategoryExists(payload.category)
+    }
+
     setMessage(editingId ? '更新成功' : '新增成功')
     resetForm()
     await refreshAll()
+  }
+
+  async function ensureCategoryExists(categoryName) {
+    const trimmedName = categoryName.trim()
+    if (!trimmedName) return
+
+    const exists = menuCategories.some((category) => category.name === trimmedName)
+    if (exists) return
+
+    const maxOrder =
+      menuCategories.length === 0
+        ? 0
+        : Math.max(...menuCategories.map((category) => Number(category.sort_order) || 0))
+
+    await supabase.from('menu_categories').insert([
+      {
+        name: trimmedName,
+        sort_order: maxOrder + 1,
+      },
+    ])
+  }
+
+  async function handleCategorySubmit(e) {
+    e.preventDefault()
+    setMessage('')
+
+    if (!categoryForm.name.trim()) {
+      setMessage('請輸入分類名稱')
+      return
+    }
+
+    if (categoryForm.sort_order === '' || Number.isNaN(Number(categoryForm.sort_order))) {
+      setMessage('請輸入分類順序數字')
+      return
+    }
+
+    setCategoryLoading(true)
+
+    const payload = {
+      name: categoryForm.name.trim(),
+      sort_order: Number(categoryForm.sort_order),
+    }
+
+    let error
+
+    if (editingCategoryId) {
+      const result = await supabase
+        .from('menu_categories')
+        .update(payload)
+        .eq('id', editingCategoryId)
+      error = result.error
+    } else {
+      const result = await supabase.from('menu_categories').insert([payload])
+      error = result.error
+    }
+
+    setCategoryLoading(false)
+
+    if (error) {
+      setMessage((editingCategoryId ? '更新分類失敗：' : '新增分類失敗：') + error.message)
+      return
+    }
+
+    setMessage(editingCategoryId ? '更新分類成功' : '新增分類成功')
+    resetCategoryForm()
+    await fetchMenuCategories()
   }
 
   async function handleDelete(id) {
@@ -209,6 +326,30 @@ export default function App() {
 
     setMessage('刪除成功')
     await refreshAll()
+  }
+
+  async function handleDeleteCategory(category) {
+    const usedCount = menuItems.filter((item) => item.category === category.name).length
+
+    const confirmed = window.confirm(
+      usedCount > 0
+        ? `確定要刪除「${category.name}」分類嗎？目前有 ${usedCount} 個商品使用這個分類。刪除分類不會刪除商品，但客戶端會把這類商品排到最後。`
+        : `確定要刪除「${category.name}」分類嗎？`
+    )
+
+    if (!confirmed) return
+
+    const { error } = await supabase.from('menu_categories').delete().eq('id', category.id)
+
+    if (error) {
+      setMessage('刪除分類失敗：' + error.message)
+      return
+    }
+
+    if (editingCategoryId === category.id) resetCategoryForm()
+
+    setMessage('刪除分類成功')
+    await fetchMenuCategories()
   }
 
   function handleOptionInputChange(menuItemId, field, value) {
@@ -259,10 +400,7 @@ export default function App() {
     const confirmed = window.confirm('確定要刪除這個選項嗎？')
     if (!confirmed) return
 
-    const { error } = await supabase
-      .from('menu_item_options')
-      .delete()
-      .eq('id', optionId)
+    const { error } = await supabase.from('menu_item_options').delete().eq('id', optionId)
 
     if (error) {
       setMessage('刪除選項失敗：' + error.message)
@@ -303,9 +441,23 @@ export default function App() {
     await fetchOrders()
   }
 
+  const categoryOrderMap = useMemo(() => {
+    const map = {}
+    menuCategories.forEach((category) => {
+      map[category.name] = Number(category.sort_order) || 999
+    })
+    return map
+  }, [menuCategories])
+
   const sortedMenuItems = useMemo(() => {
-    return [...menuItems].sort((a, b) => a.id - b.id)
-  }, [menuItems])
+    return [...menuItems].sort((a, b) => {
+      const orderA = categoryOrderMap[a.category] ?? 9999
+      const orderB = categoryOrderMap[b.category] ?? 9999
+
+      if (orderA !== orderB) return orderA - orderB
+      return a.id - b.id
+    })
+  }, [menuItems, categoryOrderMap])
 
   const pendingOrders = useMemo(
     () => orders.filter((order) => order.status === 'pending'),
@@ -323,104 +475,198 @@ export default function App() {
         <div style={styles.hero}>
           <h1 style={styles.pageTitle}>蝦米攏烏｜商家端</h1>
           <p style={styles.pageSubtitle}>
-            這裡同時管理菜單與接單。顧客端之後送出的訂單，會顯示在下方接單區。
+            這裡同時管理菜單、分類順序與接單。顧客端會依照分類管理的順序顯示菜單。
           </p>
         </div>
 
         <div style={styles.layout}>
-          <section style={styles.card}>
-            <h2 style={styles.title}>商品管理</h2>
+          <div style={styles.leftColumn}>
+            <section style={styles.card}>
+              <h2 style={styles.title}>商品管理</h2>
 
-            <form onSubmit={handleSubmit} style={styles.form}>
-              <div style={styles.field}>
-                <label style={styles.label}>商品名稱</label>
-                <input
-                  name="name"
-                  value={form.name}
-                  onChange={handleChange}
-                  placeholder="例如：滷肉飯"
-                  style={styles.input}
-                />
+              <form onSubmit={handleSubmit} style={styles.form}>
+                <div style={styles.field}>
+                  <label style={styles.label}>商品名稱</label>
+                  <input
+                    name="name"
+                    value={form.name}
+                    onChange={handleChange}
+                    placeholder="例如：滷肉飯"
+                    style={styles.input}
+                  />
+                </div>
+
+                <div style={styles.field}>
+                  <label style={styles.label}>價格</label>
+                  <input
+                    name="price"
+                    type="number"
+                    value={form.price}
+                    onChange={handleChange}
+                    placeholder="例如：80"
+                    style={styles.input}
+                  />
+                </div>
+
+                <div style={styles.field}>
+                  <label style={styles.label}>分類</label>
+                  <input
+                    name="category"
+                    value={form.category}
+                    onChange={handleChange}
+                    placeholder="例如：主餐、飲料、炸物"
+                    style={styles.input}
+                    list="category-options"
+                  />
+                  <datalist id="category-options">
+                    {menuCategories.map((category) => (
+                      <option key={category.id} value={category.name} />
+                    ))}
+                  </datalist>
+                  <div style={styles.hintText}>
+                    可直接輸入新分類；新增商品後，系統會自動把新分類加入分類管理。
+                  </div>
+                </div>
+
+                <div style={styles.field}>
+                  <label style={styles.label}>圖片網址</label>
+                  <input
+                    name="image_url"
+                    value={form.image_url}
+                    onChange={handleChange}
+                    placeholder="貼上商品圖片網址"
+                    style={styles.input}
+                  />
+                </div>
+
+                <div style={styles.field}>
+                  <label style={styles.label}>商品說明</label>
+                  <input
+                    name="note"
+                    value={form.note}
+                    onChange={handleChange}
+                    placeholder="例如：招牌必點、每日限量"
+                    style={styles.input}
+                  />
+                </div>
+
+                <label style={styles.checkRow}>
+                  <input
+                    name="is_available"
+                    type="checkbox"
+                    checked={form.is_available}
+                    onChange={handleChange}
+                  />
+                  <span>上架中</span>
+                </label>
+
+                <label style={styles.checkRow}>
+                  <input
+                    name="allow_custom_note"
+                    type="checkbox"
+                    checked={form.allow_custom_note}
+                    onChange={handleChange}
+                  />
+                  <span>允許顧客自行輸入備註</span>
+                </label>
+
+                <div style={styles.buttonRow}>
+                  <button type="submit" style={styles.primaryButton} disabled={loading}>
+                    {loading ? '處理中...' : editingId ? '更新商品' : '新增商品'}
+                  </button>
+
+                  <button type="button" style={styles.secondaryButton} onClick={resetForm}>
+                    清空
+                  </button>
+                </div>
+              </form>
+
+              {message ? <p style={styles.message}>{message}</p> : null}
+            </section>
+
+            <section style={styles.card}>
+              <h2 style={styles.title}>分類管理</h2>
+              <p style={styles.sectionDescription}>
+                數字越小越前面。修改後，客戶端重新整理就會照新的順序顯示。
+              </p>
+
+              <form onSubmit={handleCategorySubmit} style={styles.form}>
+                <div style={styles.field}>
+                  <label style={styles.label}>分類名稱</label>
+                  <input
+                    name="name"
+                    value={categoryForm.name}
+                    onChange={handleCategoryChange}
+                    placeholder="例如：主餐"
+                    style={styles.input}
+                  />
+                </div>
+
+                <div style={styles.field}>
+                  <label style={styles.label}>排序數字</label>
+                  <input
+                    name="sort_order"
+                    type="number"
+                    value={categoryForm.sort_order}
+                    onChange={handleCategoryChange}
+                    placeholder="例如：1"
+                    style={styles.input}
+                  />
+                </div>
+
+                <div style={styles.buttonRow}>
+                  <button type="submit" style={styles.primaryButton} disabled={categoryLoading}>
+                    {categoryLoading
+                      ? '處理中...'
+                      : editingCategoryId
+                      ? '更新分類'
+                      : '新增分類'}
+                  </button>
+
+                  <button type="button" style={styles.secondaryButton} onClick={resetCategoryForm}>
+                    清空
+                  </button>
+                </div>
+              </form>
+
+              <div style={styles.categoryList}>
+                {menuCategories.length === 0 ? (
+                  <p style={styles.empty}>目前還沒有分類</p>
+                ) : (
+                  menuCategories.map((category) => {
+                    const usedCount = menuItems.filter((item) => item.category === category.name)
+                      .length
+
+                    return (
+                      <div key={category.id} style={styles.categoryItem}>
+                        <div>
+                          <div style={styles.categoryName}>{category.name}</div>
+                          <div style={styles.categoryMeta}>
+                            排序：{category.sort_order}｜商品數：{usedCount}
+                          </div>
+                        </div>
+
+                        <div style={styles.categoryActionRow}>
+                          <button
+                            style={styles.editButton}
+                            onClick={() => handleEditCategory(category)}
+                          >
+                            編輯
+                          </button>
+                          <button
+                            style={styles.deleteButton}
+                            onClick={() => handleDeleteCategory(category)}
+                          >
+                            刪除
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })
+                )}
               </div>
-
-              <div style={styles.field}>
-                <label style={styles.label}>價格</label>
-                <input
-                  name="price"
-                  type="number"
-                  value={form.price}
-                  onChange={handleChange}
-                  placeholder="例如：80"
-                  style={styles.input}
-                />
-              </div>
-
-              <div style={styles.field}>
-                <label style={styles.label}>分類</label>
-                <input
-                  name="category"
-                  value={form.category}
-                  onChange={handleChange}
-                  placeholder="例如：主餐、飲料、炸物"
-                  style={styles.input}
-                />
-              </div>
-
-              <div style={styles.field}>
-                <label style={styles.label}>圖片網址</label>
-                <input
-                  name="image_url"
-                  value={form.image_url}
-                  onChange={handleChange}
-                  placeholder="貼上商品圖片網址"
-                  style={styles.input}
-                />
-              </div>
-
-              <div style={styles.field}>
-                <label style={styles.label}>商品說明</label>
-                <input
-                  name="note"
-                  value={form.note}
-                  onChange={handleChange}
-                  placeholder="例如：招牌必點、每日限量"
-                  style={styles.input}
-                />
-              </div>
-
-              <label style={styles.checkRow}>
-                <input
-                  name="is_available"
-                  type="checkbox"
-                  checked={form.is_available}
-                  onChange={handleChange}
-                />
-                <span>上架中</span>
-              </label>
-
-              <label style={styles.checkRow}>
-                <input
-                  name="allow_custom_note"
-                  type="checkbox"
-                  checked={form.allow_custom_note}
-                  onChange={handleChange}
-                />
-                <span>允許顧客自行輸入備註</span>
-              </label>
-
-              <div style={styles.buttonRow}>
-                <button type="submit" style={styles.primaryButton} disabled={loading}>
-                  {loading ? '處理中...' : editingId ? '更新商品' : '新增商品'}
-                </button>
-
-                <button type="button" style={styles.secondaryButton} onClick={resetForm}>
-                  清空
-                </button>
-              </div>
-            </form>
-
-            {message ? <p style={styles.message}>{message}</p> : null}
-          </section>
+            </section>
+          </div>
 
           <div style={styles.rightColumn}>
             <section style={styles.card}>
@@ -433,6 +679,7 @@ export default function App() {
                   {sortedMenuItems.map((item) => {
                     const options = optionsMap[item.id] || []
                     const optionForm = optionForms[item.id] || emptyOptionForm
+                    const isCategoryKnown = Boolean(categoryOrderMap[item.category])
 
                     return (
                       <div key={item.id} style={styles.menuCard}>
@@ -451,7 +698,14 @@ export default function App() {
                               </div>
 
                               <div style={styles.badgeRow}>
-                                <span style={styles.badge}>
+                                <span
+                                  style={{
+                                    ...styles.badge,
+                                    ...(!isCategoryKnown && item.category
+                                      ? styles.badgeWarning
+                                      : {}),
+                                  }}
+                                >
                                   {item.category || '未分類'}
                                 </span>
                                 <span
@@ -469,9 +723,13 @@ export default function App() {
                                 </span>
                               </div>
 
-                              <div style={styles.noteText}>
-                                {item.note || '無商品說明'}
-                              </div>
+                              {!isCategoryKnown && item.category ? (
+                                <div style={styles.warningText}>
+                                  這個分類尚未在分類管理中設定，客戶端會排在最後。
+                                </div>
+                              ) : null}
+
+                              <div style={styles.noteText}>{item.note || '無商品說明'}</div>
                             </div>
                           </div>
 
@@ -574,9 +832,7 @@ export default function App() {
                                 桌號：{order.table_number}｜付款：{order.payment_method}
                               </div>
                             </div>
-                            <div style={{ ...styles.badge, ...styles.badgePending }}>
-                              待接單
-                            </div>
+                            <div style={{ ...styles.badge, ...styles.badgePending }}>待接單</div>
                           </div>
 
                           <div style={styles.orderItems}>
@@ -673,6 +929,19 @@ export default function App() {
                                   <div style={styles.orderItemMeta}>
                                     單價 NT$ {item.unit_price}
                                   </div>
+                                  {Array.isArray(item.selected_options) &&
+                                  item.selected_options.length > 0 ? (
+                                    <div style={styles.orderItemMeta}>
+                                      選項：
+                                      {item.selected_options
+                                        .map((opt) =>
+                                          typeof opt === 'string'
+                                            ? opt
+                                            : opt.label || JSON.stringify(opt)
+                                        )
+                                        .join('、')}
+                                    </div>
+                                  ) : null}
                                   {item.customer_note ? (
                                     <div style={styles.orderItemMeta}>
                                       備註：{item.customer_note}
@@ -737,6 +1006,11 @@ const styles = {
     gridTemplateColumns: 'minmax(320px, 420px) minmax(0, 1fr)',
     gap: 20,
   },
+  leftColumn: {
+    display: 'grid',
+    gap: 20,
+    alignContent: 'start',
+  },
   rightColumn: {
     display: 'grid',
     gap: 20,
@@ -753,6 +1027,13 @@ const styles = {
     marginBottom: 18,
     fontSize: '28px',
     color: adminColors.primary,
+  },
+  sectionDescription: {
+    marginTop: -8,
+    marginBottom: 18,
+    fontSize: '16px',
+    color: adminColors.dark,
+    lineHeight: 1.7,
   },
   form: {
     display: 'grid',
@@ -777,6 +1058,11 @@ const styles = {
     outline: 'none',
     background: '#fff',
     color: adminColors.primary,
+  },
+  hintText: {
+    fontSize: '14px',
+    color: adminColors.dark,
+    lineHeight: 1.6,
   },
   checkRow: {
     display: 'flex',
@@ -822,6 +1108,37 @@ const styles = {
   empty: {
     fontSize: '17px',
     color: adminColors.dark,
+  },
+  categoryList: {
+    display: 'grid',
+    gap: 12,
+    marginTop: 18,
+  },
+  categoryItem: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: 12,
+    alignItems: 'center',
+    padding: 14,
+    borderRadius: 16,
+    border: `1px solid ${adminColors.soft}`,
+    background: adminColors.light,
+  },
+  categoryName: {
+    fontSize: '19px',
+    fontWeight: 700,
+    color: adminColors.primary,
+  },
+  categoryMeta: {
+    marginTop: 5,
+    fontSize: '15px',
+    color: adminColors.dark,
+  },
+  categoryActionRow: {
+    display: 'flex',
+    gap: 8,
+    flexWrap: 'wrap',
+    justifyContent: 'flex-end',
   },
   menuList: {
     display: 'grid',
@@ -906,6 +1223,17 @@ const styles = {
   badgePending: {
     background: '#f5ead8',
     color: '#8a5a1e',
+  },
+  badgeWarning: {
+    background: '#fff0d8',
+    color: '#9b5c00',
+  },
+  warningText: {
+    marginTop: 8,
+    fontSize: '15px',
+    color: '#9b5c00',
+    lineHeight: 1.6,
+    fontWeight: 700,
   },
   noteText: {
     marginTop: 10,
@@ -1091,5 +1419,8 @@ if (typeof window !== 'undefined') {
   if (media.matches) {
     styles.layout.gridTemplateColumns = '1fr'
     styles.addOptionRow.gridTemplateColumns = '1fr'
+    styles.categoryItem.flexDirection = 'column'
+    styles.categoryItem.alignItems = 'flex-start'
+    styles.categoryActionRow.justifyContent = 'flex-start'
   }
 }
