@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { supabase } from './supabase'
+import { deleteOrder } from './orderDeletion'
 
 const adminColors = {
   primary: '#384C65',
@@ -35,6 +36,14 @@ export default function App() {
   const [optionsMap, setOptionsMap] = useState({})
   const [orders, setOrders] = useState([])
   const [orderItemsMap, setOrderItemsMap] = useState({})
+  const [orderToDelete, setOrderToDelete] = useState(null)
+  const [deletingOrderId, setDeletingOrderId] = useState(null)
+  const [orderMessage, setOrderMessage] = useState('')
+  const [deleteError, setDeleteError] = useState('')
+  const deleteDialogRef = useRef(null)
+  const deleteInFlight = useRef(false)
+  const ordersRequestId = useRef(0)
+  const ordersFetchBusy = useRef(false)
 
   const [form, setForm] = useState(emptyForm)
   const [editingId, setEditingId] = useState(null)
@@ -97,34 +106,38 @@ export default function App() {
   }
 
   async function fetchOrders() {
-    const { data: ordersData, error: ordersError } = await supabase
-      .from('orders')
-      .select('*')
-      .order('created_at', { ascending: false })
+    if (ordersFetchBusy.current) return
+    ordersFetchBusy.current = true
+    const requestId = ++ordersRequestId.current
+    try {
+      const { data: ordersData, error: ordersError } = await supabase
+        .from('orders')
+        .select('*')
+        .order('created_at', { ascending: false })
 
-    if (ordersError) {
-      setMessage('讀取訂單失敗：' + ordersError.message)
-      return
+      if (requestId !== ordersRequestId.current) return
+      if (ordersError) throw new Error(ordersError.message)
+
+      const { data: orderItemsData, error: orderItemsError } = await supabase
+        .from('order_items')
+        .select('*')
+        .order('id', { ascending: true })
+
+      if (requestId !== ordersRequestId.current) return
+      if (orderItemsError) throw new Error('訂單明細：' + orderItemsError.message)
+
+      const grouped = {}
+      ;(orderItemsData || []).forEach((item) => {
+        if (!grouped[item.order_id]) grouped[item.order_id] = []
+        grouped[item.order_id].push(item)
+      })
+      setOrders(ordersData || [])
+      setOrderItemsMap(grouped)
+    } catch (error) {
+      if (requestId === ordersRequestId.current) setOrderMessage('讀取訂單失敗：' + error.message)
+    } finally {
+      ordersFetchBusy.current = false
     }
-
-    setOrders(ordersData || [])
-
-    const { data: orderItemsData, error: orderItemsError } = await supabase
-      .from('order_items')
-      .select('*')
-      .order('id', { ascending: true })
-
-    if (orderItemsError) {
-      setMessage('讀取訂單明細失敗：' + orderItemsError.message)
-      return
-    }
-
-    const grouped = {}
-    ;(orderItemsData || []).forEach((item) => {
-      if (!grouped[item.order_id]) grouped[item.order_id] = []
-      grouped[item.order_id].push(item)
-    })
-    setOrderItemsMap(grouped)
   }
 
   async function refreshAll() {
@@ -132,14 +145,27 @@ export default function App() {
   }
 
   useEffect(() => {
-    refreshAll()
+    // Data loading is asynchronous; schedule startup after mounting the UI.
+    const startup = setTimeout(() => { void refreshAll() }, 0)
 
     const timer = setInterval(() => {
       fetchOrders()
     }, 3000)
 
-    return () => clearInterval(timer)
+    return () => {
+      clearTimeout(startup)
+      clearInterval(timer)
+      ordersRequestId.current += 1
+    }
+    // These loaders only use the stable client, refs and React state setters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  useEffect(() => {
+    const dialog = deleteDialogRef.current
+    if (orderToDelete && !dialog.open) dialog.showModal()
+    if (!orderToDelete && dialog.open) dialog.close()
+  }, [orderToDelete])
 
   function handleChange(e) {
     const { name, value, type, checked } = e.target
@@ -426,19 +452,45 @@ export default function App() {
     await fetchOrders()
   }
 
-  async function handleDeleteOrder(orderId) {
-    const confirmed = window.confirm('確定要刪除這筆訂單嗎？')
-    if (!confirmed) return
+  function handleDeleteOrder(order) {
+    if (deleteInFlight.current) return
+    setDeleteError('')
+    setOrderMessage('')
+    setOrderToDelete(order)
+  }
 
-    const { error } = await supabase.from('orders').delete().eq('id', orderId)
+  function cancelDeleteOrder() {
+    if (!deleteInFlight.current) setOrderToDelete(null)
+  }
 
-    if (error) {
-      setMessage('刪除訂單失敗：' + error.message)
-      return
+  async function confirmDeleteOrder() {
+    if (!orderToDelete || deleteInFlight.current) return
+    const orderId = orderToDelete.id
+    deleteInFlight.current = true
+    setDeletingOrderId(orderId)
+    setDeleteError('')
+    try {
+      await deleteOrder(supabase, orderId)
+      // Ignore any poll started before this deletion, so it cannot resurrect the card.
+      ordersRequestId.current += 1
+      setOrders((previous) => previous.filter((order) => String(order.id) !== String(orderId)))
+      setOrderItemsMap((previous) => {
+        const next = { ...previous }
+        delete next[orderId]
+        return next
+      })
+      setOrderMessage(`已刪除訂單 #${orderId} 及其明細。`)
+      setOrderToDelete(null)
+      void fetchOrders()
+    } catch (error) {
+      const detail = error instanceof TypeError
+        ? '連線中斷，無法確認刪除結果。請重新整理訂單後再試。'
+        : error.message || '無法確認刪除結果，請重新整理後再試。'
+      setDeleteError('刪除訂單失敗：' + detail)
+    } finally {
+      deleteInFlight.current = false
+      setDeletingOrderId(null)
     }
-
-    setMessage('刪除訂單成功')
-    await fetchOrders()
   }
 
   const categoryOrderMap = useMemo(() => {
@@ -813,6 +865,7 @@ export default function App() {
 
             <section style={styles.card}>
               <h2 style={styles.title}>接單區</h2>
+              {orderMessage ? <p role="status" style={styles.message}>{orderMessage}</p> : null}
 
               <div style={styles.orderSection}>
                 <h3 style={styles.orderTitle}>待接訂單</h3>
@@ -878,12 +931,15 @@ export default function App() {
                               <button
                                 style={styles.acceptButton}
                                 onClick={() => handleAcceptOrder(order.id)}
+                                disabled={deletingOrderId !== null}
                               >
                                 接單
                               </button>
                               <button
+                                type="button"
                                 style={styles.deleteButton}
-                                onClick={() => handleDeleteOrder(order.id)}
+                                onClick={() => handleDeleteOrder(order)}
+                                disabled={deletingOrderId !== null}
                               >
                                 刪除訂單
                               </button>
@@ -955,8 +1011,10 @@ export default function App() {
                           <div style={styles.orderFooter}>
                             <div style={styles.orderTotal}>總金額 NT$ {order.total_amount}</div>
                             <button
+                              type="button"
                               style={styles.deleteButton}
-                              onClick={() => handleDeleteOrder(order.id)}
+                              onClick={() => handleDeleteOrder(order)}
+                              disabled={deletingOrderId !== null}
                             >
                               刪除訂單
                             </button>
@@ -971,11 +1029,47 @@ export default function App() {
           </div>
         </div>
       </div>
+      <dialog
+        ref={deleteDialogRef}
+        aria-labelledby="delete-order-title"
+        aria-describedby="delete-order-description"
+        aria-busy={deletingOrderId !== null}
+        onCancel={(event) => { event.preventDefault(); cancelDeleteOrder() }}
+        style={styles.deleteDialog}
+      >
+        <h2 id="delete-order-title" style={styles.title}>確認刪除訂單</h2>
+        {orderToDelete ? (
+          <p id="delete-order-description">
+            訂單 #{orderToDelete.id}｜桌號：{orderToDelete.table_number}｜總金額 NT$ {orderToDelete.total_amount}
+            <br />這筆訂單及其明細將永久刪除，無法復原。
+          </p>
+        ) : null}
+        {deleteError ? <p role="alert" style={{ color: '#a12622' }}>{deleteError}</p> : null}
+        <div style={styles.orderActionRow}>
+          <button type="button" autoFocus onClick={cancelDeleteOrder} disabled={deletingOrderId !== null} style={styles.secondaryButton}>
+            取消，保留訂單
+          </button>
+          <button type="button" onClick={confirmDeleteOrder} disabled={deletingOrderId !== null} style={styles.deleteButton}>
+            {deletingOrderId !== null ? '刪除中…' : '確認永久刪除'}
+          </button>
+        </div>
+      </dialog>
     </div>
   )
 }
 
 const styles = {
+  deleteDialog: {
+    width: 'min(520px, calc(100vw - 48px))',
+    boxSizing: 'border-box',
+    border: '2px solid #384C65',
+    borderRadius: 16,
+    padding: 24,
+    lineHeight: 1.8,
+    color: adminColors.primary,
+    background: adminColors.light,
+    boxShadow: '0 12px 80px rgba(0,0,0,0.35)',
+  },
   page: {
     minHeight: '100vh',
     background: adminColors.light,
