@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { supabase } from './supabase'
 import { deleteOrder } from './orderDeletion'
+import { acceptOrderSnapshot, deleteOrderSnapshot, readAllOrderRows } from './orderBatchActions'
 
 const adminColors = {
   primary: '#384C65',
@@ -38,12 +39,16 @@ export default function App() {
   const [orderItemsMap, setOrderItemsMap] = useState({})
   const [orderToDelete, setOrderToDelete] = useState(null)
   const [deletingOrderId, setDeletingOrderId] = useState(null)
+  const [acceptingOrderId, setAcceptingOrderId] = useState(null)
+  const [ordersLoaded, setOrdersLoaded] = useState(false)
+  const [deleteAttempted, setDeleteAttempted] = useState(false)
   const [orderMessage, setOrderMessage] = useState('')
   const [deleteError, setDeleteError] = useState('')
   const deleteDialogRef = useRef(null)
   const deleteInFlight = useRef(false)
   const ordersRequestId = useRef(0)
   const ordersFetchBusy = useRef(false)
+  const orderMutationBusy = deletingOrderId !== null || acceptingOrderId !== null
 
   const [form, setForm] = useState(emptyForm)
   const [editingId, setEditingId] = useState(null)
@@ -110,31 +115,25 @@ export default function App() {
     ordersFetchBusy.current = true
     const requestId = ++ordersRequestId.current
     try {
-      const { data: ordersData, error: ordersError } = await supabase
-        .from('orders')
-        .select('*')
-        .order('created_at', { ascending: false })
-
+      const [ordersData, orderItemsData] = await Promise.all([
+        readAllOrderRows(supabase, 'orders'),
+        readAllOrderRows(supabase, 'order_items'),
+      ])
       if (requestId !== ordersRequestId.current) return
-      if (ordersError) throw new Error(ordersError.message)
-
-      const { data: orderItemsData, error: orderItemsError } = await supabase
-        .from('order_items')
-        .select('*')
-        .order('id', { ascending: true })
-
-      if (requestId !== ordersRequestId.current) return
-      if (orderItemsError) throw new Error('訂單明細：' + orderItemsError.message)
 
       const grouped = {}
       ;(orderItemsData || []).forEach((item) => {
         if (!grouped[item.order_id]) grouped[item.order_id] = []
         grouped[item.order_id].push(item)
       })
-      setOrders(ordersData || [])
+      setOrders(ordersData.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)))
       setOrderItemsMap(grouped)
+      setOrdersLoaded(true)
     } catch (error) {
-      if (requestId === ordersRequestId.current) setOrderMessage('讀取訂單失敗：' + error.message)
+      if (requestId === ordersRequestId.current) {
+        setOrdersLoaded(false)
+        setOrderMessage('讀取訂單失敗：' + error.message)
+      }
     } finally {
       ordersFetchBusy.current = false
     }
@@ -437,26 +436,47 @@ export default function App() {
     await fetchOptions()
   }
 
-  async function handleAcceptOrder(orderId) {
-    const { error } = await supabase
-      .from('orders')
-      .update({ status: 'accepted' })
-      .eq('id', orderId)
-
-    if (error) {
-      setMessage('接單失敗：' + error.message)
-      return
+  async function handleAcceptOrder(orderId = null) {
+    if (deleteInFlight.current || !ordersLoaded) return
+    const ids = orderId === null
+      ? orders.filter(order => order.status === 'pending').map(order => order.id)
+      : [orderId]
+    if (!ids.length) return
+    deleteInFlight.current = true
+    setAcceptingOrderId(orderId ?? 'all')
+    setOrderMessage(`正在接收 ${ids.length} 筆訂單…`)
+    try {
+      const result = await acceptOrderSnapshot(supabase, ids)
+      const accepted = new Set(result.affectedIds.map(String))
+      ordersRequestId.current += 1
+      setOrders(previous => previous.map(order => accepted.has(String(order.id)) ? { ...order, status: 'accepted' } : order))
+      setOrderMessage(`已接單 ${accepted.size}／${ids.length} 筆。` +
+        (result.unconfirmedIds.length ? `其餘 ${result.unconfirmedIds.length} 筆未確認變更，可能已由其他裝置處理。` : '') +
+        (result.error ? ` ${result.error} 請重新整理確認。` : ''))
+    } catch (error) {
+      setOrderMessage('接單失敗：' + error.message)
+    } finally {
+      deleteInFlight.current = false
+      setAcceptingOrderId(null)
+      void fetchOrders()
     }
-
-    setMessage('接單成功')
-    await fetchOrders()
   }
 
   function handleDeleteOrder(order) {
-    if (deleteInFlight.current) return
+    if (deleteInFlight.current || !ordersLoaded) return
     setDeleteError('')
+    setDeleteAttempted(false)
     setOrderMessage('')
-    setOrderToDelete(order)
+    setOrderToDelete({ bulk: false, orders: [{ ...order }] })
+  }
+
+  function handleDeleteAllOrders() {
+    if (deleteInFlight.current || !ordersLoaded || !orders.length) return
+    setDeleteError('')
+    setDeleteAttempted(false)
+    setOrderMessage('')
+    // This snapshot never grows when the background poll receives newer orders.
+    setOrderToDelete({ bulk: true, orders: orders.map(order => ({ ...order })) })
   }
 
   function cancelDeleteOrder() {
@@ -464,24 +484,34 @@ export default function App() {
   }
 
   async function confirmDeleteOrder() {
-    if (!orderToDelete || deleteInFlight.current) return
-    const orderId = orderToDelete.id
+    if (!orderToDelete || deleteInFlight.current || deleteAttempted) return
+    const ids = orderToDelete.orders.map(order => order.id)
     deleteInFlight.current = true
-    setDeletingOrderId(orderId)
+    setDeletingOrderId(orderToDelete.bulk ? 'all' : ids[0])
     setDeleteError('')
+    setDeleteAttempted(true)
     try {
-      await deleteOrder(supabase, orderId)
+      const result = orderToDelete.bulk
+        ? await deleteOrderSnapshot(supabase, ids)
+        : { affectedIds: [await deleteOrder(supabase, ids[0])], unconfirmedIds: [], error: null }
+      const removed = new Set(result.affectedIds.map(String))
       // Ignore any poll started before this deletion, so it cannot resurrect the card.
       ordersRequestId.current += 1
-      setOrders((previous) => previous.filter((order) => String(order.id) !== String(orderId)))
+      setOrders(previous => previous.filter(order => !removed.has(String(order.id))))
       setOrderItemsMap((previous) => {
         const next = { ...previous }
-        delete next[orderId]
+        result.affectedIds.forEach(id => { delete next[id] })
         return next
       })
-      setOrderMessage(`已刪除訂單 #${orderId} 及其明細。`)
-      setOrderToDelete(null)
-      void fetchOrders()
+      const summary = `已刪除 ${removed.size}／${ids.length} 筆訂單及其明細。`
+      if (result.unconfirmedIds.length || result.error) {
+        const detail = `${summary} 其餘 ${result.unconfirmedIds.length} 筆未確認刪除。${result.error || '可能已由其他裝置刪除，或沒有刪除權限。'} 請關閉視窗，重新確認訂單後再操作。`
+        setDeleteError(detail)
+        setOrderMessage(detail)
+      } else {
+        setOrderMessage(summary)
+        setOrderToDelete(null)
+      }
     } catch (error) {
       const detail = error instanceof TypeError
         ? '連線中斷，無法確認刪除結果。請重新整理訂單後再試。'
@@ -490,6 +520,7 @@ export default function App() {
     } finally {
       deleteInFlight.current = false
       setDeletingOrderId(null)
+      void fetchOrders()
     }
   }
 
@@ -865,6 +896,15 @@ export default function App() {
 
             <section style={styles.card}>
               <h2 style={styles.title}>接單區</h2>
+              <div style={styles.orderActionRow}>
+                <button type="button" style={styles.acceptButton} onClick={() => handleAcceptOrder()} disabled={!ordersLoaded || orderMutationBusy || pendingOrders.length === 0}>
+                  {acceptingOrderId === 'all' ? '全部接單中…' : `全部接單（${pendingOrders.length} 筆）`}
+                </button>
+                <button type="button" style={styles.deleteButton} onClick={handleDeleteAllOrders} disabled={!ordersLoaded || orderMutationBusy || orders.length === 0}>
+                  {deletingOrderId === 'all' ? '全部刪除中…' : `全部刪除（${orders.length} 筆）`}
+                </button>
+              </div>
+              <p style={styles.orderMeta}>全部接單只處理待接訂單；全部刪除包含待接與已接訂單，需先確認筆數。操作後新進的訂單不受影響。</p>
               {orderMessage ? <p role="status" style={styles.message}>{orderMessage}</p> : null}
 
               <div style={styles.orderSection}>
@@ -931,15 +971,15 @@ export default function App() {
                               <button
                                 style={styles.acceptButton}
                                 onClick={() => handleAcceptOrder(order.id)}
-                                disabled={deletingOrderId !== null}
+                                disabled={orderMutationBusy || !ordersLoaded}
                               >
-                                接單
+                                {acceptingOrderId === order.id ? '接單中…' : '接單'}
                               </button>
                               <button
                                 type="button"
                                 style={styles.deleteButton}
                                 onClick={() => handleDeleteOrder(order)}
-                                disabled={deletingOrderId !== null}
+                                disabled={orderMutationBusy || !ordersLoaded}
                               >
                                 刪除訂單
                               </button>
@@ -1014,7 +1054,7 @@ export default function App() {
                               type="button"
                               style={styles.deleteButton}
                               onClick={() => handleDeleteOrder(order)}
-                              disabled={deletingOrderId !== null}
+                              disabled={orderMutationBusy || !ordersLoaded}
                             >
                               刪除訂單
                             </button>
@@ -1037,21 +1077,30 @@ export default function App() {
         onCancel={(event) => { event.preventDefault(); cancelDeleteOrder() }}
         style={styles.deleteDialog}
       >
-        <h2 id="delete-order-title" style={styles.title}>確認刪除訂單</h2>
-        {orderToDelete ? (
+        <h2 id="delete-order-title" style={styles.title}>{orderToDelete?.bulk ? '確認全部刪除' : '確認刪除訂單'}</h2>
+        {orderToDelete?.bulk ? (
           <p id="delete-order-description">
-            訂單 #{orderToDelete.id}｜桌號：{orderToDelete.table_number}｜總金額 NT$ {orderToDelete.total_amount}
+            將永久刪除 <strong>{orderToDelete.orders.length} 筆訂單</strong>及其全部明細。
+            <br />其中待接 {orderToDelete.orders.filter(order => order.status === 'pending').length} 筆、已接 {orderToDelete.orders.filter(order => order.status === 'accepted').length} 筆。
+            <br />包含訂單編號：{orderToDelete.orders.slice(0, 12).map(order => `#${order.id}`).join('、')}{orderToDelete.orders.length > 12 ? '…' : ''}
+            <br />此動作無法復原。這個確認視窗開啟後新進的訂單不會刪除。
+          </p>
+        ) : orderToDelete ? (
+          <p id="delete-order-description">
+            訂單 #{orderToDelete.orders[0].id}｜桌號：{orderToDelete.orders[0].table_number}｜總金額 NT$ {orderToDelete.orders[0].total_amount}
             <br />這筆訂單及其明細將永久刪除，無法復原。
           </p>
         ) : null}
         {deleteError ? <p role="alert" style={{ color: '#a12622' }}>{deleteError}</p> : null}
         <div style={styles.orderActionRow}>
           <button type="button" autoFocus onClick={cancelDeleteOrder} disabled={deletingOrderId !== null} style={styles.secondaryButton}>
-            取消，保留訂單
+            {deleteAttempted ? '關閉，重新確認訂單' : '取消，保留訂單'}
           </button>
-          <button type="button" onClick={confirmDeleteOrder} disabled={deletingOrderId !== null} style={styles.deleteButton}>
-            {deletingOrderId !== null ? '刪除中…' : '確認永久刪除'}
-          </button>
+          {!deleteAttempted || deletingOrderId !== null ? (
+            <button type="button" onClick={confirmDeleteOrder} disabled={deletingOrderId !== null} style={styles.deleteButton}>
+              {deletingOrderId !== null ? '刪除中…' : orderToDelete?.bulk ? `確認刪除這 ${orderToDelete.orders.length} 筆` : '確認永久刪除'}
+            </button>
+          ) : null}
         </div>
       </dialog>
     </div>
